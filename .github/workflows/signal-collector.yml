@@ -1,0 +1,45 @@
+name: BSAL Signal Extraction Pipeline
+
+on:
+  schedule:
+    - cron: '*/15 * * * *' # Run every 15 minutes
+  workflow_dispatch:        # Allow manual execution
+
+jobs:
+  extract-and-persist-signals:
+    name: Extract Business Signals
+    runs-on: ubuntu-latest
+
+    services:
+      mongodb:
+        image: mongo:latest
+        ports:
+          - 27017:27017
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go Environment
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Install Dependencies
+        run: make tidy
+
+      - name: Run Unit Tests
+        run: make test
+
+      - name: Build Binary
+        run: make build
+
+      - name: Run Signal Extraction (One-Shot Mode)
+        env:
+          MONGODB_URI: mongodb://localhost:27017
+          MONGODB_DATABASE: business_signal_engine
+          RUN_MODE: oneshot
+          COUNTRY_CODE: LK
+          LATITUDE: 6.9271
+          LONGITUDE: 79.8612
+        run: ./bin/bsal-engine -mode=oneshot
