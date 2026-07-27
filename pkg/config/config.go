@@ -4,6 +4,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/joho/godotenv"
 )
@@ -11,7 +12,8 @@ import (
 type Config struct {
 	MongoURI        string
 	MongoDatabase   string
-	RunMode         string // "daemon" or "oneshot"
+	RunMode         string // "daemon", "oneshot", or "simulation"
+	EnableSimulator bool   // Explicitly enable test stream simulator
 	CountryCode     string // e.g. "LK"
 	Latitude        float64
 	Longitude       float64
@@ -21,18 +23,21 @@ type Config struct {
 }
 
 func LoadConfig() *Config {
-	// Attempt to load .env file if available
 	if err := godotenv.Load(); err != nil {
 		log.Println("[INFO] No .env file found or error reading .env, reading environment variables")
 	}
 
+	mode := getEnv("RUN_MODE", "daemon")
+	enableSim := getEnvBool("ENABLE_SIMULATOR", false) || strings.EqualFold(mode, "simulation")
+
 	return &Config{
 		MongoURI:        getEnv("MONGODB_URI", "mongodb://localhost:27017"),
 		MongoDatabase:   getEnv("MONGODB_DATABASE", "business_signal_engine"),
-		RunMode:         getEnv("RUN_MODE", "daemon"),
-		CountryCode:     getEnv("COUNTRY_CODE", "LK"), // Default Sri Lanka
-		Latitude:        getEnvFloat("LATITUDE", 6.9271),  // Colombo latitude
-		Longitude:       getEnvFloat("LONGITUDE", 79.8612), // Colombo longitude
+		RunMode:         mode,
+		EnableSimulator: enableSim,
+		CountryCode:     getEnv("COUNTRY_CODE", "LK"),
+		Latitude:        getEnvFloat("LATITUDE", 6.9271),
+		Longitude:       getEnvFloat("LONGITUDE", 79.8612),
 		GAPropertyID:    os.Getenv("GA_PROPERTY_ID"),
 		MetaAccessToken: os.Getenv("META_ACCESS_TOKEN"),
 		MetaAdAccountID: os.Getenv("META_AD_ACCOUNT_ID"),
@@ -44,6 +49,18 @@ func getEnv(key, fallback string) string {
 		return val
 	}
 	return fallback
+}
+
+func getEnvBool(key string, fallback bool) bool {
+	valStr := os.Getenv(key)
+	if valStr == "" {
+		return fallback
+	}
+	val, err := strconv.ParseBool(valStr)
+	if err != nil {
+		return fallback
+	}
+	return val
 }
 
 func getEnvFloat(key string, fallback float64) float64 {

@@ -18,12 +18,18 @@ import (
 func main() {
 	cfg := config.LoadConfig()
 
-	modeFlag := flag.String("mode", cfg.RunMode, "Execution mode: 'daemon' (continuous ticker) or 'oneshot' (single pass & exit)")
+	modeFlag := flag.String("mode", cfg.RunMode, "Execution mode: 'daemon' (continuous ticker), 'oneshot' (single pass & exit), or 'simulation'")
+	simulateFlag := flag.Bool("simulate", cfg.EnableSimulator, "Enable test stream simulator module for testing/demo")
 	flag.Parse()
+
+	if *simulateFlag || *modeFlag == "simulation" {
+		cfg.EnableSimulator = true
+	}
 
 	log.Printf("=================================================================")
 	log.Printf("   Business Signal Abstraction Layer (BSAL) Engine Starting      ")
 	log.Printf("   Mode: %s | Target Country: %s | DB: MongoDB                   ", *modeFlag, cfg.CountryCode)
+	log.Printf("   Simulator Active: %v                                           ", cfg.EnableSimulator)
 	log.Printf("=================================================================")
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -49,20 +55,22 @@ func main() {
 		_ = repo.Close(closeCtx)
 	}()
 
-	// Instantiate providers
-	gaProvider := provider.NewGoogleAnalyticsProvider(cfg)
-	metaProvider := provider.NewMetaBusinessProvider(cfg)
-	weatherProvider := provider.NewWeatherProvider(cfg)
-	calendarProvider := provider.NewCalendarProvider(cfg)
+	// Instantiate production providers
+	providersList := []provider.SignalProvider{
+		provider.NewGoogleAnalyticsProvider(cfg),
+		provider.NewMetaBusinessProvider(cfg),
+		provider.NewWeatherProvider(cfg),
+		provider.NewCalendarProvider(cfg),
+	}
+
+	// Register dedicated Test Stream Simulator if enabled
+	if cfg.EnableSimulator {
+		log.Printf("[INFO] Registering dedicated Test Stream Simulator module...")
+		providersList = append(providersList, provider.NewSimulatorProvider(cfg))
+	}
 
 	// Create pipeline collector
-	collector := pipeline.NewCollector(
-		repo,
-		gaProvider,
-		metaProvider,
-		weatherProvider,
-		calendarProvider,
-	)
+	collector := pipeline.NewCollector(repo, providersList...)
 
 	if *modeFlag == "oneshot" {
 		if err := collector.RunOneShot(ctx); err != nil {

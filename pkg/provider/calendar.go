@@ -40,7 +40,7 @@ func (p *CalendarProvider) Name() string {
 }
 
 func (p *CalendarProvider) PollFrequency() time.Duration {
-	return 30 * time.Minute // Poll calendar every 30 minutes
+	return 30 * time.Minute
 }
 
 func (p *CalendarProvider) Fetch(ctx context.Context) ([]model.Signal, error) {
@@ -55,14 +55,14 @@ func (p *CalendarProvider) Fetch(ctx context.Context) ([]model.Signal, error) {
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
-		log.Printf("[WARN] Calendar API error, fallback to simulated holiday signal: %v", err)
-		return p.generateMockSignals(), nil
+		log.Printf("[WARN] Calendar API error: %v. Skipping extraction.", err)
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("[WARN] Calendar API status %d, fallback to simulated holiday signal", resp.StatusCode)
-		return p.generateMockSignals(), nil
+		log.Printf("[WARN] Calendar API returned status %d. Skipping extraction.", resp.StatusCode)
+		return nil, fmt.Errorf("calendar API returned status code %d", resp.StatusCode)
 	}
 
 	var holidays []nagerHoliday
@@ -104,10 +104,10 @@ func (p *CalendarProvider) Fetch(ctx context.Context) ([]model.Signal, error) {
 			Unit:       "boolean",
 			Confidence: 1.0,
 			Metadata: map[string]interface{}{
-				"country":        p.cfg.CountryCode,
-				"isHoliday":      isTodayHoliday,
-				"holidayName":    todayHolidayName,
-				"upcomingCount":  upcomingHolidaysCount,
+				"country":       p.cfg.CountryCode,
+				"isHoliday":     isTodayHoliday,
+				"holidayName":   todayHolidayName,
+				"upcomingCount": upcomingHolidaysCount,
 			},
 			Timestamp: now,
 		},
@@ -127,23 +127,4 @@ func (p *CalendarProvider) Fetch(ctx context.Context) ([]model.Signal, error) {
 
 	log.Printf("[INFO] [Calendar] Extracted %d signals for %s (IsTodayHoliday: %v, TodayHoliday: '%s')", len(signals), p.cfg.CountryCode, isTodayHoliday, todayHolidayName)
 	return signals, nil
-}
-
-func (p *CalendarProvider) generateMockSignals() []model.Signal {
-	now := time.Now()
-	return []model.Signal{
-		{
-			SignalID:   uuid.New().String(),
-			Source:     "calendar",
-			Type:       "public_holiday",
-			Value:      0.0,
-			Unit:       "boolean",
-			Confidence: 0.9,
-			Metadata: map[string]interface{}{
-				"country":   p.cfg.CountryCode,
-				"simulated": true,
-			},
-			Timestamp: now,
-		},
-	}
 }

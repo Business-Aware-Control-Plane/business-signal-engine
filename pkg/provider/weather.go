@@ -44,7 +44,7 @@ func (p *WeatherProvider) Name() string {
 }
 
 func (p *WeatherProvider) PollFrequency() time.Duration {
-	return 15 * time.Minute // Poll weather every 15 minutes
+	return 15 * time.Minute
 }
 
 func (p *WeatherProvider) Fetch(ctx context.Context) ([]model.Signal, error) {
@@ -61,14 +61,14 @@ func (p *WeatherProvider) Fetch(ctx context.Context) ([]model.Signal, error) {
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
-		log.Printf("[WARN] Weather API unreachable, generating simulated fallback weather data for Sri Lanka: %v", err)
-		return p.generateMockSignals(), nil
+		log.Printf("[WARN] Weather API unreachable: %v. Skipping extraction.", err)
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		log.Printf("[WARN] Weather API returned status %d, fallback to simulation", resp.StatusCode)
-		return p.generateMockSignals(), nil
+		log.Printf("[WARN] Weather API returned status %d. Skipping extraction.", resp.StatusCode)
+		return nil, fmt.Errorf("weather API returned status code %d", resp.StatusCode)
 	}
 
 	var data openMeteoResponse
@@ -122,37 +122,4 @@ func (p *WeatherProvider) Fetch(ctx context.Context) ([]model.Signal, error) {
 
 	log.Printf("[INFO] [Weather] Extracted %d signals for Sri Lanka (Temp: %.1f C, Rain: %.1f mm)", len(signals), data.Current.Temperature2m, data.Current.Rain)
 	return signals, nil
-}
-
-func (p *WeatherProvider) generateMockSignals() []model.Signal {
-	now := time.Now()
-	return []model.Signal{
-		{
-			SignalID:   uuid.New().String(),
-			Source:     "weather",
-			Type:       "temperature",
-			Value:      29.5,
-			Unit:       "celsius",
-			Confidence: 0.85,
-			Metadata: map[string]interface{}{
-				"latitude":  p.cfg.Latitude,
-				"longitude": p.cfg.Longitude,
-				"country":   p.cfg.CountryCode,
-				"simulated": true,
-			},
-			Timestamp: now,
-		},
-		{
-			SignalID:   uuid.New().String(),
-			Source:     "weather",
-			Type:       "rain_mm",
-			Value:      2.4,
-			Unit:       "mm",
-			Confidence: 0.85,
-			Metadata: map[string]interface{}{
-				"simulated": true,
-			},
-			Timestamp: now,
-		},
-	}
 }

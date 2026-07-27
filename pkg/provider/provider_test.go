@@ -8,47 +8,55 @@ import (
 	"github.com/Business-Aware-Control-Plane/business-signal-engine/pkg/provider"
 )
 
-func TestProvidersSignalExtraction(t *testing.T) {
+func TestSimulatorStreamExtraction(t *testing.T) {
 	cfg := &config.Config{
 		CountryCode: "LK",
 		Latitude:    6.9271,
 		Longitude:   79.8612,
 	}
 
-	ctx := context.Background()
-
-	providers := []provider.SignalProvider{
-		provider.NewGoogleAnalyticsProvider(cfg),
-		provider.NewMetaBusinessProvider(cfg),
-		provider.NewWeatherProvider(cfg),
-		provider.NewCalendarProvider(cfg),
+	simProvider := provider.NewSimulatorProvider(cfg)
+	signals, err := simProvider.Fetch(context.Background())
+	if err != nil {
+		t.Fatalf("SimulatorStream Fetch failed: %v", err)
 	}
 
-	for _, p := range providers {
-		t.Run(p.Name(), func(t *testing.T) {
-			signals, err := p.Fetch(ctx)
-			if err != nil {
-				t.Fatalf("Provider %s Fetch failed: %v", p.Name(), err)
-			}
+	if len(signals) == 0 {
+		t.Errorf("SimulatorStream returned 0 signals")
+	}
 
-			if len(signals) == 0 {
-				t.Errorf("Provider %s returned 0 signals", p.Name())
-			}
+	for _, s := range signals {
+		if s.Source == "" {
+			t.Errorf("Simulator signal has empty Source")
+		}
+		if s.Type == "" {
+			t.Errorf("Simulator signal has empty Type")
+		}
+		if s.Confidence < 0.0 || s.Confidence > 1.0 {
+			t.Errorf("Simulator signal has invalid confidence score: %f", s.Confidence)
+		}
+	}
+}
 
-			for _, s := range signals {
-				if s.Source == "" {
-					t.Errorf("Signal from %s has empty Source", p.Name())
-				}
-				if s.Type == "" {
-					t.Errorf("Signal from %s has empty Type", p.Name())
-				}
-				if s.Confidence < 0.0 || s.Confidence > 1.0 {
-					t.Errorf("Signal from %s has invalid confidence score: %f", p.Name(), s.Confidence)
-				}
-				if s.Timestamp.IsZero() {
-					t.Errorf("Signal from %s has zero timestamp", p.Name())
-				}
-			}
-		})
+func TestUnsetCredentialsHandling(t *testing.T) {
+	cfg := &config.Config{}
+	ctx := context.Background()
+
+	ga := provider.NewGoogleAnalyticsProvider(cfg)
+	signals, err := ga.Fetch(ctx)
+	if err != nil {
+		t.Errorf("GoogleAnalytics should not return error on unset credentials: %v", err)
+	}
+	if len(signals) != 0 {
+		t.Errorf("GoogleAnalytics should return 0 signals when credentials are unset to avoid fake data, got %d", len(signals))
+	}
+
+	meta := provider.NewMetaBusinessProvider(cfg)
+	signals, err = meta.Fetch(ctx)
+	if err != nil {
+		t.Errorf("MetaBusiness should not return error on unset credentials: %v", err)
+	}
+	if len(signals) != 0 {
+		t.Errorf("MetaBusiness should return 0 signals when credentials are unset to avoid fake data, got %d", len(signals))
 	}
 }
