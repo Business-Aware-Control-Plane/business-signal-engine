@@ -9,9 +9,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Business-Aware-Control-Plane/business-signal-engine/pkg/ai"
 	"github.com/Business-Aware-Control-Plane/business-signal-engine/pkg/config"
+	"github.com/Business-Aware-Control-Plane/business-signal-engine/pkg/correlation"
 	"github.com/Business-Aware-Control-Plane/business-signal-engine/pkg/pipeline"
 	"github.com/Business-Aware-Control-Plane/business-signal-engine/pkg/provider"
+	"github.com/Business-Aware-Control-Plane/business-signal-engine/pkg/publisher"
 	"github.com/Business-Aware-Control-Plane/business-signal-engine/pkg/storage"
 )
 
@@ -44,7 +47,7 @@ func main() {
 		cancel()
 	}()
 
-	// Initialize MongoDB repository
+	// 1. Initialize MongoDB Repository
 	repo, err := storage.NewMongoRepository(ctx, cfg)
 	if err != nil {
 		log.Fatalf("[FATAL] Database initialization failed: %v", err)
@@ -55,7 +58,21 @@ func main() {
 		_ = repo.Close(closeCtx)
 	}()
 
-	// Instantiate production providers
+	// 2. Initialize Gemini AI Service
+	aiService, err := ai.NewAIService(ctx, cfg)
+	if err != nil {
+		log.Printf("[WARN] AI Service initialization warning: %v", err)
+	}
+	defer aiService.Close()
+
+	// 3. Initialize Correlation Engine
+	corrEngine := correlation.NewCorrelationEngine(aiService)
+
+	// 4. Initialize RabbitMQ Event Publisher
+	eventPublisher := publisher.NewRabbitMQPublisher(cfg)
+	defer eventPublisher.Close()
+
+	// 5. Instantiate Providers
 	providersList := []provider.SignalProvider{
 		provider.NewGoogleAnalyticsProvider(cfg),
 		provider.NewMetaBusinessProvider(cfg),
@@ -63,23 +80,27 @@ func main() {
 		provider.NewCalendarProvider(cfg),
 	}
 
-	// Register dedicated Test Stream Simulator if enabled
 	if cfg.EnableSimulator {
 		log.Printf("[INFO] Registering dedicated Test Stream Simulator module...")
 		providersList = append(providersList, provider.NewSimulatorProvider(cfg))
 	}
 
-	// Create pipeline collector
-	collector := pipeline.NewCollector(repo, providersList...)
+	// 6. Create Pipeline Collector
+	collector := pipeline.NewCollector(
+		repo,
+		corrEngine,
+		eventPublisher,
+		providersList...,
+	)
 
 	if *modeFlag == "oneshot" {
 		if err := collector.RunOneShot(ctx); err != nil {
-			log.Fatalf("[FATAL] One-Shot collection failed: %v", err)
+			log.Fatalf("[FATAL] One-Shot pipeline failed: %v", err)
 		}
-		log.Println("[INFO] BSAL One-Shot extraction completed cleanly.")
+		log.Println("[INFO] BSAL One-Shot pipeline completed cleanly.")
 	} else {
 		if err := collector.RunDaemon(ctx); err != nil {
-			log.Fatalf("[FATAL] Daemon collector error: %v", err)
+			log.Fatalf("[FATAL] Daemon collector pipeline error: %v", err)
 		}
 	}
 }

@@ -6,31 +6,47 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Business-Aware-Control-Plane/business-signal-engine/pkg/correlation"
 	"github.com/Business-Aware-Control-Plane/business-signal-engine/pkg/model"
+	"github.com/Business-Aware-Control-Plane/business-signal-engine/pkg/processor"
 	"github.com/Business-Aware-Control-Plane/business-signal-engine/pkg/provider"
+	"github.com/Business-Aware-Control-Plane/business-signal-engine/pkg/publisher"
 	"github.com/Business-Aware-Control-Plane/business-signal-engine/pkg/storage"
+	"github.com/google/uuid"
 )
 
 type Collector struct {
-	providers []provider.SignalProvider
-	repo      storage.SignalRepository
+	providers   []provider.SignalProvider
+	repo        storage.SignalRepository
+	validator   *processor.SignalValidator
+	aligner     *processor.SlidingWindowAligner
+	corrEngine  *correlation.CorrelationEngine
+	publisher   publisher.EventPublisher
 }
 
-func NewCollector(repo storage.SignalRepository, providers ...provider.SignalProvider) *Collector {
+func NewCollector(
+	repo storage.SignalRepository,
+	corrEngine *correlation.CorrelationEngine,
+	pub publisher.EventPublisher,
+	providers ...provider.SignalProvider,
+) *Collector {
 	return &Collector{
-		providers: providers,
-		repo:      repo,
+		providers:  providers,
+		repo:       repo,
+		validator:  processor.NewSignalValidator(),
+		aligner:    processor.NewSlidingWindowAligner(5 * time.Minute),
+		corrEngine: corrEngine,
+		publisher:  pub,
 	}
 }
 
-// RunOneShot executes all registered providers concurrently once, persists all returned signals into MongoDB, and exits.
+// RunOneShot executes signal collection, validation, correlation, timeline storage, and RabbitMQ publishing once.
 func (c *Collector) RunOneShot(ctx context.Context) error {
-	log.Printf("[INFO] Starting One-Shot signal extraction across %d providers", len(c.providers))
+	log.Printf("[INFO] Starting One-Shot pipeline across %d providers", len(c.providers))
 
 	signalChan := make(chan model.Signal, 200)
 	var wg sync.WaitGroup
 
-	// Concurrently trigger each provider in its own goroutine
 	for _, p := range c.providers {
 		wg.Add(1)
 		go func(prov provider.SignalProvider) {
@@ -47,77 +63,117 @@ func (c *Collector) RunOneShot(ctx context.Context) error {
 		}(p)
 	}
 
-	// Wait for all provider goroutines to finish then close channel
 	go func() {
 		wg.Wait()
 		close(signalChan)
 	}()
 
-	var allSignals []model.Signal
+	var rawSignals []model.Signal
 	for sig := range signalChan {
-		allSignals = append(allSignals, sig)
+		rawSignals = append(rawSignals, sig)
 	}
 
-	if len(allSignals) > 0 {
-		if err := c.repo.SaveSignals(ctx, allSignals); err != nil {
-			return err
+	// 1. Validate & Clean Signals
+	validSignals := c.validator.ValidateAndClean(rawSignals)
+
+	// 2. Persist Raw Signals to MongoDB
+	if len(validSignals) > 0 {
+		if err := c.repo.SaveSignals(ctx, validSignals); err != nil {
+			log.Printf("[ERROR] Failed to save signals: %v", err)
 		}
 	}
 
-	log.Printf("[INFO] One-Shot collection completed successfully. Total signals persisted: %d", len(allSignals))
+	// 3. Sliding Window Alignment & Correlation Analysis
+	now := time.Now()
+	window, aligned := c.aligner.AlignToWindow(validSignals, now)
+
+	event, err := c.corrEngine.Evaluate(ctx, window, aligned)
+	if err != nil {
+		log.Printf("[WARN] Correlation analysis error: %v", err)
+	}
+
+	if event != nil {
+		if event.EventID == "" {
+			event.EventID = uuid.New().String()
+		}
+
+		// 4. Save Event to MongoDB Business Timeline
+		if err := c.repo.SaveBusinessEvent(ctx, event); err != nil {
+			log.Printf("[ERROR] Failed to save BusinessEvent to timeline: %v", err)
+		}
+
+		// 5. Publish Event JSON to RabbitMQ
+		if err := c.publisher.PublishBusinessEvent(ctx, event); err != nil {
+			log.Printf("[ERROR] Failed to publish BusinessEvent to RabbitMQ: %v", err)
+		}
+	}
+
+	log.Printf("[INFO] One-Shot pipeline completed successfully. Valid Signals: %d, BusinessEvents Generated: %v", len(validSignals), event != nil)
 	return nil
 }
 
-// RunDaemon starts continuous polling goroutines per provider and streams signals to MongoDB.
+// RunDaemon starts continuous polling goroutines per provider and streams events to RabbitMQ.
 func (c *Collector) RunDaemon(ctx context.Context) error {
-	log.Printf("[INFO] Starting Daemon mode collector with %d registered providers", len(c.providers))
+	log.Printf("[INFO] Starting Daemon pipeline collector with %d registered providers", len(c.providers))
 
 	signalChan := make(chan model.Signal, 500)
 	var wg sync.WaitGroup
 
-	// Consumer goroutine: receives signals from channel and saves to MongoDB
+	// Consumer & Correlation Pipeline Goroutine
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		var batch []model.Signal
-		ticker := time.NewTicker(2 * time.Second)
+		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
+
+		processBatch := func() {
+			if len(batch) == 0 {
+				return
+			}
+			valid := c.validator.ValidateAndClean(batch)
+			if len(valid) > 0 {
+				_ = c.repo.SaveSignals(ctx, valid)
+				now := time.Now()
+				window, aligned := c.aligner.AlignToWindow(valid, now)
+				evt, err := c.corrEngine.Evaluate(ctx, window, aligned)
+				if err == nil && evt != nil {
+					if evt.EventID == "" {
+						evt.EventID = uuid.New().String()
+					}
+					_ = c.repo.SaveBusinessEvent(ctx, evt)
+					_ = c.publisher.PublishBusinessEvent(ctx, evt)
+				}
+			}
+			batch = nil
+		}
 
 		for {
 			select {
 			case sig, ok := <-signalChan:
 				if !ok {
-					if len(batch) > 0 {
-						_ = c.repo.SaveSignals(context.Background(), batch)
-					}
+					processBatch()
 					return
 				}
 				batch = append(batch, sig)
 				if len(batch) >= 20 {
-					_ = c.repo.SaveSignals(ctx, batch)
-					batch = nil
+					processBatch()
 				}
 			case <-ticker.C:
-				if len(batch) > 0 {
-					_ = c.repo.SaveSignals(ctx, batch)
-					batch = nil
-				}
+				processBatch()
 			case <-ctx.Done():
-				if len(batch) > 0 {
-					_ = c.repo.SaveSignals(context.Background(), batch)
-				}
+				processBatch()
 				return
 			}
 		}
 	}()
 
-	// Producer goroutines: per provider ticker loop
+	// Producer Goroutines
 	for _, p := range c.providers {
 		wg.Add(1)
 		go func(prov provider.SignalProvider) {
 			defer wg.Done()
 
-			// Run immediately on start
 			signals, err := prov.Fetch(ctx)
 			if err == nil {
 				for _, s := range signals {
@@ -131,17 +187,14 @@ func (c *Collector) RunDaemon(ctx context.Context) error {
 			for {
 				select {
 				case <-ticker.C:
-					log.Printf("[INFO] Ticker triggered for provider '%s'", prov.Name())
 					sigs, err := prov.Fetch(ctx)
 					if err != nil {
-						log.Printf("[ERROR] Ticker fetch error for '%s': %v", prov.Name(), err)
 						continue
 					}
 					for _, s := range sigs {
 						signalChan <- s
 					}
 				case <-ctx.Done():
-					log.Printf("[INFO] Stopping ticker loop for provider '%s'", prov.Name())
 					return
 				}
 			}
@@ -149,9 +202,9 @@ func (c *Collector) RunDaemon(ctx context.Context) error {
 	}
 
 	<-ctx.Done()
-	log.Printf("[INFO] Graceful shutdown initiated. Waiting for worker goroutines...")
+	log.Printf("[INFO] Shutdown signal received. Flushing pipeline buffers...")
 	close(signalChan)
 	wg.Wait()
-	log.Printf("[INFO] Daemon collector shutdown complete.")
+	log.Printf("[INFO] Daemon collector pipeline shutdown complete.")
 	return nil
 }

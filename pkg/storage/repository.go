@@ -6,10 +6,12 @@ import (
 	"github.com/Business-Aware-Control-Plane/business-signal-engine/pkg/model"
 )
 
-// SignalRepository defines storage operations for business signals.
+// SignalRepository defines storage operations for business signals and timeline events.
 type SignalRepository interface {
 	EnsureIndexes(ctx context.Context) error
 	SaveSignals(ctx context.Context, signals []model.Signal) error
 	GetRecentSignals(ctx context.Context, limit int) ([]model.Signal, error)
+	SaveBusinessEvent(ctx context.Context, event *model.BusinessEvent) error
+	GetBusinessTimeline(ctx context.Context, limit int) ([]model.BusinessEvent, error)
 	Close(ctx context.Context) error
 }

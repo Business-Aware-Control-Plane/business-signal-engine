@@ -30,6 +30,11 @@ type Config struct {
 	MetaClientToken      string
 	ThreadsAppID         string
 	ThreadsAppSecret     string
+	GeminiAPIKey         string
+	GeminiModel          string
+	RabbitMQURI          string
+	RabbitMQExchange     string
+	RabbitMQQueue        string
 }
 
 func LoadConfig() *Config {
@@ -44,7 +49,6 @@ func LoadConfig() *Config {
 	metaAppSecret := os.Getenv("META_APP_SECRET")
 	metaToken := os.Getenv("META_ACCESS_TOKEN")
 
-	// If explicit user access token is unset, fallback to App Access Token format (AppID|AppSecret)
 	if metaToken == "" && metaAppID != "" && metaAppSecret != "" {
 		metaToken = fmt.Sprintf("%s|%s", metaAppID, metaAppSecret)
 	}
@@ -69,6 +73,11 @@ func LoadConfig() *Config {
 		MetaClientToken:      os.Getenv("META_CLIENT_TOKEN"),
 		ThreadsAppID:         os.Getenv("THREADS_APP_ID"),
 		ThreadsAppSecret:     os.Getenv("THREADS_APP_SECRET"),
+		GeminiAPIKey:         os.Getenv("GEMINI_API_KEY"),
+		GeminiModel:          getEnv("GEMINI_MODEL", "gemini-2.5-flash"),
+		RabbitMQURI:          getEnv("RABBITMQ_URI", "amqp://guest:guest@localhost:5672/"),
+		RabbitMQExchange:     getEnv("RABBITMQ_EXCHANGE", "business_events_exchange"),
+		RabbitMQQueue:        getEnv("RABBITMQ_QUEUE", "business_events"),
 	}
 }
 
