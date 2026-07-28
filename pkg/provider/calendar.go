@@ -60,6 +60,26 @@ func (p *CalendarProvider) Fetch(ctx context.Context) ([]model.Signal, error) {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusNoContent {
+		log.Printf("[INFO] [Calendar] Calendar API returned 204 No Content for %s. Reporting 0 active holidays.", p.cfg.CountryCode)
+		return []model.Signal{
+			{
+				SignalID:   uuid.New().String(),
+				Source:     "calendar",
+				Type:       "public_holiday",
+				Value:      0.0,
+				Unit:       "boolean",
+				Confidence: 1.0,
+				Metadata: map[string]interface{}{
+					"country":       p.cfg.CountryCode,
+					"isHoliday":     false,
+					"upcomingCount": 0,
+				},
+				Timestamp: now,
+			},
+		}, nil
+	}
+
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("[WARN] Calendar API returned status %d. Skipping extraction.", resp.StatusCode)
 		return nil, fmt.Errorf("calendar API returned status code %d", resp.StatusCode)
