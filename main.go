@@ -12,6 +12,7 @@ import (
 	"github.com/Business-Aware-Control-Plane/business-signal-engine/pkg/ai"
 	"github.com/Business-Aware-Control-Plane/business-signal-engine/pkg/config"
 	"github.com/Business-Aware-Control-Plane/business-signal-engine/pkg/correlation"
+	"github.com/Business-Aware-Control-Plane/business-signal-engine/pkg/memory"
 	"github.com/Business-Aware-Control-Plane/business-signal-engine/pkg/pipeline"
 	"github.com/Business-Aware-Control-Plane/business-signal-engine/pkg/provider"
 	"github.com/Business-Aware-Control-Plane/business-signal-engine/pkg/publisher"
@@ -58,26 +59,30 @@ func main() {
 		_ = repo.Close(closeCtx)
 	}()
 
-	// 2. Initialize Gemini AI Service
+	// 2. Initialize Dual-Memory Engine (STM & LTM Baselines)
+	memoryEngine := memory.NewMemoryEngine(repo)
+
+	// 3. Initialize Gemini AI Service
 	aiService, err := ai.NewAIService(ctx, cfg)
 	if err != nil {
 		log.Printf("[WARN] AI Service initialization warning: %v", err)
 	}
 	defer aiService.Close()
 
-	// 3. Initialize Correlation Engine
-	corrEngine := correlation.NewCorrelationEngine(aiService)
+	// 4. Initialize Correlation Engine
+	corrEngine := correlation.NewCorrelationEngine(aiService, memoryEngine)
 
-	// 4. Initialize RabbitMQ Event Publisher
+	// 5. Initialize RabbitMQ Event Publisher
 	eventPublisher := publisher.NewRabbitMQPublisher(cfg)
 	defer eventPublisher.Close()
 
-	// 5. Instantiate Providers
+	// 6. Instantiate Providers
 	providersList := []provider.SignalProvider{
 		provider.NewGoogleAnalyticsProvider(cfg),
 		provider.NewMetaBusinessProvider(cfg),
 		provider.NewWeatherProvider(cfg),
 		provider.NewCalendarProvider(cfg),
+		provider.NewPrometheusProvider(cfg),
 	}
 
 	if cfg.EnableSimulator {
@@ -85,7 +90,7 @@ func main() {
 		providersList = append(providersList, provider.NewSimulatorProvider(cfg))
 	}
 
-	// 6. Create Pipeline Collector
+	// 7. Create Pipeline Collector
 	collector := pipeline.NewCollector(
 		repo,
 		corrEngine,

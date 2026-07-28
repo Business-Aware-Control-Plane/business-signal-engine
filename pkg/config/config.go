@@ -32,6 +32,7 @@ type Config struct {
 	ThreadsAppSecret     string
 	GeminiAPIKey         string
 	GeminiModel          string
+	PrometheusURL        string
 	RabbitMQURI          string
 	RabbitMQExchange     string
 	RabbitMQQueue        string
@@ -75,6 +76,7 @@ func LoadConfig() *Config {
 		ThreadsAppSecret:     os.Getenv("THREADS_APP_SECRET"),
 		GeminiAPIKey:         os.Getenv("GEMINI_API_KEY"),
 		GeminiModel:          getEnv("GEMINI_MODEL", "gemini-2.5-flash"),
+		PrometheusURL:        getEnv("PROMETHEUS_URL", "http://localhost:9090"),
 		RabbitMQURI:          getEnv("RABBITMQ_URI", "amqp://guest:guest@localhost:5672/"),
 		RabbitMQExchange:     getEnv("RABBITMQ_EXCHANGE", "business_events_exchange"),
 		RabbitMQQueue:        getEnv("RABBITMQ_QUEUE", "business_events"),

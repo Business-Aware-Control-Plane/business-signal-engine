@@ -8,7 +8,9 @@ import (
 	"strings"
 
 	"github.com/Business-Aware-Control-Plane/business-signal-engine/pkg/config"
+	"github.com/Business-Aware-Control-Plane/business-signal-engine/pkg/memory"
 	"github.com/Business-Aware-Control-Plane/business-signal-engine/pkg/model"
+	"github.com/Business-Aware-Control-Plane/business-signal-engine/pkg/processor"
 	"github.com/google/generative-ai-go/genai"
 	"google.golang.org/api/option"
 )
@@ -19,8 +21,8 @@ type AIService struct {
 }
 
 type AIAnalysisResult struct {
-	EventType  string  `json:"eventType"`  // e.g. "ExpectedDemandIncrease", "ViralMarketingSpike"
-	Category   string  `json:"category"`   // e.g. "Marketing", "Environmental", "Operational"
+	EventType  string  `json:"eventType"`  // e.g. "ExpectedDemandIncrease", "ViralMarketingSpike", "NormalBusinessActivity"
+	Category   string  `json:"category"`   // e.g. "Marketing", "Environmental", "Operational", "Business Calendar"
 	Severity   string  `json:"severity"`   // "Low", "Medium", "High", "Critical"
 	Confidence float64 `json:"confidence"` // 0.0 to 1.0
 	AISummary  string  `json:"aiSummary"`  // Rich narrative rationale
@@ -41,14 +43,20 @@ func NewAIService(ctx context.Context, cfg *config.Config) (*AIService, error) {
 	return &AIService{cfg: cfg, client: client}, nil
 }
 
-func (a *AIService) AnalyzeSignalsAndCorrelate(ctx context.Context, signals []model.Signal, rulesTriggered []string) (*AIAnalysisResult, error) {
+func (a *AIService) AnalyzeSignalsAndCorrelate(
+	ctx context.Context,
+	signals []model.Signal,
+	baselines map[string]memory.BaselineComparison,
+	guardrails processor.GuardrailResult,
+	rulesTriggered []string,
+) (*AIAnalysisResult, error) {
 	if len(signals) == 0 {
 		return nil, nil
 	}
 
 	if a.client == nil {
 		log.Printf("[INFO] [AIService] Running deterministic fallback AI synthesis on %d active signals", len(signals))
-		return a.fallbackCorrelation(signals, rulesTriggered), nil
+		return a.fallbackCorrelation(signals, guardrails, rulesTriggered), nil
 	}
 
 	modelName := a.cfg.GeminiModel
@@ -56,29 +64,50 @@ func (a *AIService) AnalyzeSignalsAndCorrelate(ctx context.Context, signals []mo
 		modelName = "gemini-2.5-flash"
 	}
 
-	log.Printf("[INFO] [AIService] 🤖 Invoking Gemini AI model '%s' to analyze %d signals and %d triggered correlation rules...", modelName, len(signals), len(rulesTriggered))
+	log.Printf("[INFO] [AIService] 🤖 Invoking Gemini AI model '%s' to analyze %d signals with Dual-Memory Baselines & Guardrails...", modelName, len(signals))
 
 	modelClient := a.client.GenerativeModel(modelName)
 	modelClient.SetTemperature(0.2) // Low temperature for deterministic classification
 
-	prompt := fmt.Sprintf(`Analyze the following real-time business and external signals and evaluate potential business impact for a cloud-native platform in Sri Lanka:
+	prompt := fmt.Sprintf(`SYSTEM INSTRUCTIONS & GUARDRAILS:
+You are an expert AIOps engine for cloud-native applications in Sri Lanka.
+CRITICAL ZERO-HALLUCINATION RULES:
+1. NEVER infer a "Conversion Funnel Bottleneck", "System Error", or "Critical Anomaly" when active user traffic or HTTP request volume is low (%s). Low traffic during off-peak hours is NORMAL baseline behavior.
+2. Cross-reference external user traffic with internal Prometheus infrastructure telemetry (HTTP 5xx error rate, CPU utilization). If 5xx errors are 0%% and CPU is under baseline, classify system status as "NormalBusinessActivity" with Severity "Low".
+3. Evaluate metric values strictly against the provided Short-Term (24h) and Long-Term Seasonal baselines.
 
-Active Signals: %v
-Triggered Correlation Rules: %v
+ACTIVE SIGNALS:
+%s
 
-Task: Synthesize these signals and return a JSON object with:
-- "eventType": (string, e.g. "ExpectedDemandIncrease", "WeatherDisruption", "ViralCampaignSpike")
-- "category": (string, e.g. "Marketing", "Environmental", "Operational", "Business Calendar")
+DUAL-MEMORY BASELINES (STM 24h & LTM Seasonal):
+%s
+
+STATISTICAL GUARDRAILS:
+%s
+
+TRIGGERED RULES:
+%v
+
+TASK:
+Return a JSON object with:
+- "eventType": (string, e.g. "NormalBusinessActivity", "ExpectedDemandIncrease", "WeatherDemandShift", "ViralCampaignSpike")
+- "category": (string, "Operational", "Marketing", "Environmental", or "Business Calendar")
 - "severity": (string, "Low", "Medium", "High", or "Critical")
 - "confidence": (number between 0.0 and 1.0)
-- "aiSummary": (string explanation of the business context and predicted impact)
+- "aiSummary": (string explanation strictly adhering to the guardrail rules)
 
-Return ONLY valid JSON matching this schema.`, formatSignalsForPrompt(signals), rulesTriggered)
+Return ONLY valid JSON matching this schema.`,
+		guardrails.VolumeGuardrailPrompt,
+		formatSignalsForPrompt(signals),
+		formatBaselinesForPrompt(baselines),
+		guardrails.VolumeGuardrailPrompt,
+		rulesTriggered,
+	)
 
 	resp, err := modelClient.GenerateContent(ctx, genai.Text(prompt))
 	if err != nil {
 		log.Printf("[WARN] [AIService] Gemini API call failed: %v. Using fallback synthesis.", err)
-		return a.fallbackCorrelation(signals, rulesTriggered), nil
+		return a.fallbackCorrelation(signals, guardrails, rulesTriggered), nil
 	}
 
 	if len(resp.Candidates) > 0 && resp.Candidates[0].Content != nil {
@@ -102,10 +131,10 @@ Return ONLY valid JSON matching this schema.`, formatSignalsForPrompt(signals), 
 		}
 	}
 
-	return a.fallbackCorrelation(signals, rulesTriggered), nil
+	return a.fallbackCorrelation(signals, guardrails, rulesTriggered), nil
 }
 
-func (a *AIService) fallbackCorrelation(signals []model.Signal, rulesTriggered []string) *AIAnalysisResult {
+func (a *AIService) fallbackCorrelation(signals []model.Signal, guardrails processor.GuardrailResult, rulesTriggered []string) *AIAnalysisResult {
 	hasRain := false
 	hasHighGA := false
 	hasHighMeta := false
@@ -129,9 +158,11 @@ func (a *AIService) fallbackCorrelation(signals []model.Signal, rulesTriggered [
 	severity := "Low"
 	eventType := "NormalBusinessActivity"
 	category := "Operational"
-	summary := "System operating under baseline parameters."
+	summary := "System operating normally under baseline parameters."
 
-	if hasRain && (hasHighGA || hasHoliday) {
+	if guardrails.IsLowVolume {
+		summary = "Low user traffic volume detected. System operating under normal off-peak baseline parameters."
+	} else if hasRain && (hasHighGA || hasHoliday) {
 		eventType = "WeatherDemandShift"
 		category = "Environmental"
 		severity = "High"
@@ -147,7 +178,7 @@ func (a *AIService) fallbackCorrelation(signals []model.Signal, rulesTriggered [
 		EventType:  eventType,
 		Category:   category,
 		Severity:   severity,
-		Confidence: 0.90,
+		Confidence: 0.95,
 		AISummary:  summary,
 	}
 
@@ -158,9 +189,18 @@ func (a *AIService) fallbackCorrelation(signals []model.Signal, rulesTriggered [
 func formatSignalsForPrompt(signals []model.Signal) string {
 	var parts []string
 	for _, s := range signals {
-		parts = append(parts, fmt.Sprintf("%s:%s=%.2f(%s)", s.Source, s.Type, s.Value, s.Unit))
+		parts = append(parts, fmt.Sprintf("- %s:%s = %.2f (%s)", s.Source, s.Type, s.Value, s.Unit))
 	}
-	return strings.Join(parts, ", ")
+	return strings.Join(parts, "\n")
+}
+
+func formatBaselinesForPrompt(baselines map[string]memory.BaselineComparison) string {
+	var parts []string
+	for key, b := range baselines {
+		parts = append(parts, fmt.Sprintf("- %s: Current=%.2f | STM 24h Mean=%.2f | LTM Seasonal Mean=%.2f (Z_seasonal=%.2f, Norm=%v)",
+			key, b.CurrentValue, b.STMean24h, b.LTSeasonalMean, b.SeasonalZScore, b.IsSeasonalNorm))
+	}
+	return strings.Join(parts, "\n")
 }
 
 func cleanJSONResponse(raw string) string {

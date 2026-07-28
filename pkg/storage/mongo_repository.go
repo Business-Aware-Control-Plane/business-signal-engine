@@ -15,16 +15,18 @@ import (
 )
 
 const (
-	SignalsCollection  = "business_signals"
-	TimelineCollection = "business_timeline"
-	SignalTTL          = 90 * 24 * time.Hour // 90-day data retention window for streaming signals
+	SignalsCollection   = "business_signals"
+	TimelineCollection  = "business_timeline"
+	BaselinesCollection = "business_baselines"
+	SignalTTL           = 90 * 24 * time.Hour // 90-day data retention window
 )
 
 type mongoRepository struct {
-	client             *mongo.Client
-	database           *mongo.Database
-	signalsCollection  *mongo.Collection
-	timelineCollection *mongo.Collection
+	client              *mongo.Client
+	database            *mongo.Database
+	signalsCollection   *mongo.Collection
+	timelineCollection  *mongo.Collection
+	baselinesCollection *mongo.Collection
 }
 
 func NewMongoRepository(ctx context.Context, cfg *config.Config) (SignalRepository, error) {
@@ -49,10 +51,11 @@ func NewMongoRepository(ctx context.Context, cfg *config.Config) (SignalReposito
 
 	db := client.Database(cfg.MongoDatabase)
 	repo := &mongoRepository{
-		client:             client,
-		database:           db,
-		signalsCollection:  db.Collection(SignalsCollection),
-		timelineCollection: db.Collection(TimelineCollection),
+		client:              client,
+		database:            db,
+		signalsCollection:   db.Collection(SignalsCollection),
+		timelineCollection:  db.Collection(TimelineCollection),
+		baselinesCollection: db.Collection(BaselinesCollection),
 	}
 
 	if err := repo.EnsureIndexes(ctx); err != nil {
@@ -90,17 +93,22 @@ func (r *mongoRepository) EnsureIndexes(ctx context.Context) error {
 		},
 	}
 
-	_, err := r.signalsCollection.Indexes().CreateMany(ctx, signalIndexes)
-	if err != nil {
-		return fmt.Errorf("failed to create signals collection indexes: %w", err)
+	baselineIndexes := []mongo.IndexModel{
+		{
+			Keys: bson.D{
+				{Key: "metricKey", Value: 1},
+				{Key: "dayOfWeek", Value: 1},
+				{Key: "hourOfDay", Value: 1},
+			},
+			Options: options.Index().SetUnique(true).SetName("idx_metric_seasonal"),
+		},
 	}
 
-	_, err = r.timelineCollection.Indexes().CreateMany(ctx, timelineIndexes)
-	if err != nil {
-		return fmt.Errorf("failed to create timeline collection indexes: %w", err)
-	}
+	_, _ = r.signalsCollection.Indexes().CreateMany(ctx, signalIndexes)
+	_, _ = r.timelineCollection.Indexes().CreateMany(ctx, timelineIndexes)
+	_, _ = r.baselinesCollection.Indexes().CreateMany(ctx, baselineIndexes)
 
-	log.Printf("[INFO] MongoDB indexes ensured for collections '%s' and '%s'", SignalsCollection, TimelineCollection)
+	log.Printf("[INFO] MongoDB indexes ensured for collections '%s', '%s', and '%s'", SignalsCollection, TimelineCollection, BaselinesCollection)
 	return nil
 }
 
@@ -146,6 +154,24 @@ func (r *mongoRepository) GetRecentSignals(ctx context.Context, limit int) ([]mo
 	return signals, nil
 }
 
+func (r *mongoRepository) GetSignalsInWindow(ctx context.Context, duration time.Duration) ([]model.Signal, error) {
+	since := time.Now().Add(-duration)
+	filter := bson.D{{Key: "timestamp", Value: bson.D{{Key: "$gte", Value: since}}}}
+
+	cursor, err := r.signalsCollection.Find(ctx, filter)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query signals in window: %w", err)
+	}
+	defer cursor.Close(ctx)
+
+	var signals []model.Signal
+	if err := cursor.All(ctx, &signals); err != nil {
+		return nil, fmt.Errorf("failed to decode window signals: %w", err)
+	}
+
+	return signals, nil
+}
+
 func (r *mongoRepository) SaveBusinessEvent(ctx context.Context, event *model.BusinessEvent) error {
 	if event == nil {
 		return nil
@@ -185,6 +211,50 @@ func (r *mongoRepository) GetBusinessTimeline(ctx context.Context, limit int) ([
 	}
 
 	return events, nil
+}
+
+func (r *mongoRepository) GetBaselineProfile(ctx context.Context, metricKey string, dayOfWeek, hourOfDay int) (*model.BaselineProfile, error) {
+	filter := bson.D{
+		{Key: "metricKey", Value: metricKey},
+		{Key: "dayOfWeek", Value: dayOfWeek},
+		{Key: "hourOfDay", Value: hourOfDay},
+	}
+
+	var profile model.BaselineProfile
+	err := r.baselinesCollection.FindOne(ctx, filter).Decode(&profile)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	return &profile, nil
+}
+
+func (r *mongoRepository) UpdateBaselineProfile(ctx context.Context, profile *model.BaselineProfile) error {
+	if profile == nil {
+		return nil
+	}
+
+	filter := bson.D{
+		{Key: "metricKey", Value: profile.MetricKey},
+		{Key: "dayOfWeek", Value: profile.DayOfWeek},
+		{Key: "hourOfDay", Value: profile.HourOfDay},
+	}
+
+	opts := options.Update().SetUpsert(true)
+	update := bson.D{
+		{Key: "$set", Value: bson.D{
+			{Key: "meanValue", Value: profile.MeanValue},
+			{Key: "stdDevValue", Value: profile.StdDevValue},
+			{Key: "sampleCount", Value: profile.SampleCount},
+			{Key: "lastUpdated", Value: time.Now()},
+		}},
+	}
+
+	_, err := r.baselinesCollection.UpdateOne(ctx, filter, update, opts)
+	return err
 }
 
 func (r *mongoRepository) Close(ctx context.Context) error {
