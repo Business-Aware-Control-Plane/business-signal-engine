@@ -31,7 +31,10 @@ func EvaluateVolumeGuardrails(signals []model.Signal) GuardrailResult {
 
 	var suppressed []string
 	if isLowVolume {
-		suppressed = append(suppressed, "google_analytics:engagement_rate_pct", "google_analytics:bounce_rate_pct", "google_analytics:conversions")
+		// Names must match the actual Type field GoogleAnalyticsProvider emits
+		// (pkg/provider/google_analytics.go fetchCoreReport), not a display label,
+		// since pkg/significance keys off "source:type" verbatim.
+		suppressed = append(suppressed, "google_analytics:engagement_rate", "google_analytics:bounce_rate", "google_analytics:conversions")
 		log.Printf("[INFO] [Guardrails] 🛡️ Low volume detected (ActiveUsers: %.0f, HTTP Req/sec: %.2f). Suppressing ratio metrics from triggering critical anomalies.", activeUsers, httpReqs)
 	}
 

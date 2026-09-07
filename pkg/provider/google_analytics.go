@@ -27,7 +27,7 @@ func (p *GoogleAnalyticsProvider) Name() string {
 }
 
 func (p *GoogleAnalyticsProvider) PollFrequency() time.Duration {
-	return 5 * time.Minute
+	return pollFrequencyOr(p.cfg.GAPollInterval, 5*time.Minute)
 }
 
 func (p *GoogleAnalyticsProvider) Fetch(ctx context.Context) ([]model.Signal, error) {
@@ -66,6 +66,13 @@ func (p *GoogleAnalyticsProvider) Fetch(ctx context.Context) ([]model.Signal, er
 }
 
 func (p *GoogleAnalyticsProvider) createGAClient(ctx context.Context) (*analyticsdata.Service, error) {
+	var opts []option.ClientOption
+	if p.cfg.GAEndpoint != "" {
+		// Points the SDK at a fixture/mock server instead of the real Google endpoint (test-only seam).
+		opts = append(opts, option.WithEndpoint(p.cfg.GAEndpoint), option.WithoutAuthentication())
+		return analyticsdata.NewService(ctx, opts...)
+	}
+
 	if p.cfg.GoogleClientID != "" && p.cfg.GoogleRefreshToken != "" {
 		oConfig := &oauth2.Config{
 			ClientID:     p.cfg.GoogleClientID,

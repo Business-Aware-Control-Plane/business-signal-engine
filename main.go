@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -17,6 +18,7 @@ import (
 	"github.com/Business-Aware-Control-Plane/business-signal-engine/pkg/provider"
 	"github.com/Business-Aware-Control-Plane/business-signal-engine/pkg/publisher"
 	"github.com/Business-Aware-Control-Plane/business-signal-engine/pkg/storage"
+	"github.com/Business-Aware-Control-Plane/business-signal-engine/pkg/webhook"
 )
 
 func main() {
@@ -83,6 +85,11 @@ func main() {
 		provider.NewWeatherProvider(cfg),
 		provider.NewCalendarProvider(cfg),
 		provider.NewPrometheusProvider(cfg),
+		provider.NewSocialMediaProvider(cfg),
+		provider.NewBusinessCalendarProvider(cfg),
+		// Stripe's real-time path is the webhook server started below; this is
+		// only the scheduled reconciliation fallback (BSAL-HB-01 §05).
+		provider.NewStripeReconciliationProvider(cfg),
 	}
 
 	if cfg.EnableSimulator {
@@ -103,9 +110,31 @@ func main() {
 			log.Fatalf("[FATAL] One-Shot pipeline failed: %v", err)
 		}
 		log.Println("[INFO] BSAL One-Shot pipeline completed cleanly.")
-	} else {
-		if err := collector.RunDaemon(ctx); err != nil {
-			log.Fatalf("[FATAL] Daemon collector pipeline error: %v", err)
+		return
+	}
+
+	// 8. Start the webhook ingestion server (BSAL-HB-01 §05) alongside the
+	// daemon's poll loop — Stripe deliveries are pushed into the same
+	// Collector fan-in a polled signal would use, via collector.Ingest.
+	idempo := webhook.NewIdempotencyStore(24 * time.Hour)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/webhooks/stripe", webhook.NewStripeHandler(cfg.StripeWebhookSecret, collector, idempo))
+	webhookServer := &http.Server{Addr: cfg.WebhookListenAddr, Handler: mux}
+
+	go func() {
+		log.Printf("[INFO] [Webhook] Listening on %s (routes: /webhooks/stripe)", cfg.WebhookListenAddr)
+		if err := webhookServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("[ERROR] [Webhook] Server error: %v", err)
 		}
+	}()
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		_ = webhookServer.Shutdown(shutdownCtx)
+	}()
+
+	if err := collector.RunDaemon(ctx); err != nil {
+		log.Fatalf("[FATAL] Daemon collector pipeline error: %v", err)
 	}
 }

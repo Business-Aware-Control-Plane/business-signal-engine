@@ -16,6 +16,7 @@ import (
 type WeatherProvider struct {
 	cfg        *config.Config
 	httpClient *http.Client
+	BaseURL    string
 }
 
 type openMeteoResponse struct {
@@ -31,11 +32,16 @@ type openMeteoResponse struct {
 }
 
 func NewWeatherProvider(cfg *config.Config) *WeatherProvider {
+	baseURL := cfg.WeatherBaseURL
+	if baseURL == "" {
+		baseURL = "https://api.open-meteo.com"
+	}
 	return &WeatherProvider{
 		cfg: cfg,
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
+		BaseURL: baseURL,
 	}
 }
 
@@ -44,12 +50,13 @@ func (p *WeatherProvider) Name() string {
 }
 
 func (p *WeatherProvider) PollFrequency() time.Duration {
-	return 15 * time.Minute
+	return pollFrequencyOr(p.cfg.WeatherPollInterval, 15*time.Minute)
 }
 
 func (p *WeatherProvider) Fetch(ctx context.Context) ([]model.Signal, error) {
 	url := fmt.Sprintf(
-		"https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f&current=temperature_2m,relative_humidity_2m,precipitation,rain,weather_code,wind_speed_10m",
+		"%s/v1/forecast?latitude=%.4f&longitude=%.4f&current=temperature_2m,relative_humidity_2m,precipitation,rain,weather_code,wind_speed_10m",
+		p.BaseURL,
 		p.cfg.Latitude,
 		p.cfg.Longitude,
 	)

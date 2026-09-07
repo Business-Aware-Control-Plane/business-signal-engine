@@ -49,6 +49,7 @@ func (a *AIService) AnalyzeSignalsAndCorrelate(
 	baselines map[string]memory.BaselineComparison,
 	guardrails processor.GuardrailResult,
 	rulesTriggered []string,
+	drivingMetrics []string,
 ) (*AIAnalysisResult, error) {
 	if len(signals) == 0 {
 		return nil, nil
@@ -56,7 +57,7 @@ func (a *AIService) AnalyzeSignalsAndCorrelate(
 
 	if a.client == nil {
 		log.Printf("[INFO] [AIService] Running deterministic fallback AI synthesis on %d active signals", len(signals))
-		return a.fallbackCorrelation(signals, guardrails, rulesTriggered), nil
+		return a.fallbackCorrelation(drivingMetrics, guardrails, rulesTriggered), nil
 	}
 
 	modelName := a.cfg.GeminiModel
@@ -71,6 +72,10 @@ func (a *AIService) AnalyzeSignalsAndCorrelate(
 
 	prompt := fmt.Sprintf(`SYSTEM INSTRUCTIONS & GUARDRAILS:
 You are an expert AIOps engine for cloud-native applications in Sri Lanka.
+This window has already been deterministically flagged as statistically significant
+by a rule- and baseline-driven pre-filter (see TRIGGERED RULES below) — your job is
+to classify and narrate what kind of event this is, not to decide from scratch
+whether one exists at all.
 CRITICAL ZERO-HALLUCINATION RULES:
 1. NEVER infer a "Conversion Funnel Bottleneck", "System Error", or "Critical Anomaly" when active user traffic or HTTP request volume is low (%s). Low traffic during off-peak hours is NORMAL baseline behavior.
 2. Cross-reference external user traffic with internal Prometheus infrastructure telemetry (HTTP 5xx error rate, CPU utilization). If 5xx errors are 0%% and CPU is under baseline, classify system status as "NormalBusinessActivity" with Severity "Low".
@@ -88,6 +93,10 @@ STATISTICAL GUARDRAILS:
 TRIGGERED RULES:
 %v
 
+DRIVING METRICS (the specific signals that actually caused this window to be flagged —
+classify based on these, not on other signals merely present in the same window):
+%v
+
 TASK:
 Return a JSON object with:
 - "eventType": (string, e.g. "NormalBusinessActivity", "ExpectedDemandIncrease", "WeatherDemandShift", "ViralCampaignSpike")
@@ -102,12 +111,13 @@ Return ONLY valid JSON matching this schema.`,
 		formatBaselinesForPrompt(baselines),
 		guardrails.VolumeGuardrailPrompt,
 		rulesTriggered,
+		drivingMetrics,
 	)
 
 	resp, err := modelClient.GenerateContent(ctx, genai.Text(prompt))
 	if err != nil {
 		log.Printf("[WARN] [AIService] Gemini API call failed: %v. Using fallback synthesis.", err)
-		return a.fallbackCorrelation(signals, guardrails, rulesTriggered), nil
+		return a.fallbackCorrelation(drivingMetrics, guardrails, rulesTriggered), nil
 	}
 
 	if len(resp.Candidates) > 0 && resp.Candidates[0].Content != nil {
@@ -131,54 +141,105 @@ Return ONLY valid JSON matching this schema.`,
 		}
 	}
 
-	return a.fallbackCorrelation(signals, guardrails, rulesTriggered), nil
+	return a.fallbackCorrelation(drivingMetrics, guardrails, rulesTriggered), nil
 }
 
-func (a *AIService) fallbackCorrelation(signals []model.Signal, guardrails processor.GuardrailResult, rulesTriggered []string) *AIAnalysisResult {
-	hasRain := false
-	hasHighGA := false
-	hasHighMeta := false
-	hasHoliday := false
-
-	for _, s := range signals {
-		if s.Source == "weather" && s.Type == "rain_mm" && s.Value > 5.0 {
-			hasRain = true
-		}
-		if s.Source == "google_analytics" && s.Type == "active_users" && s.Value > 400 {
-			hasHighGA = true
-		}
-		if s.Source == "meta_business" && s.Type == "ad_spend_usd" && s.Value > 200 {
-			hasHighMeta = true
-		}
-		if s.Source == "calendar" && s.Type == "public_holiday" && s.Value > 0 {
-			hasHoliday = true
+// fallbackCorrelation classifies a window the significance gate has already
+// flagged (pkg/significance) — CorrelationEngine only reaches this path once
+// IsSignificant is true, so this function's job is purely "what kind of
+// event is this," never "is there an event at all."
+//
+// It classifies strictly from drivingMetrics — the specific "source:type"
+// keys the significance engine identified as the actual cause — rather than
+// scanning every signal present in the window. Two prior designs were both
+// wrong in ways this review caught: matching on hardcoded exact Source
+// strings ("weather", "google_analytics") missed the simulator's
+// "simulated_*" sources and the newer social_media/business_calendar/stripe
+// providers entirely (silently falling through to NormalBusinessActivity/Low
+// even when correctly flagged significant); and a later fix that matched on
+// Type but scanned the *whole* signal set made classification depend on
+// incidental unrelated values (e.g. rain_mm happening to roll above 5mm)
+// that had nothing to do with what was actually significant, producing a
+// different eventType on every run for the same underlying cause — which
+// silently defeated the §02 suppression window (keyed on eventType+category)
+// and worked against the reproducibility this deterministic fallback exists
+// for in the first place (proposal §3.4.3 / NFR-R1).
+func (a *AIService) fallbackCorrelation(drivingMetrics []string, guardrails processor.GuardrailResult, rulesTriggered []string) *AIAnalysisResult {
+	if len(rulesTriggered) == 0 {
+		// Defensive only: nothing in the current call path reaches this
+		// function without the significance gate already having fired, but
+		// this keeps it safe to call standalone (e.g. in tests) too.
+		return &AIAnalysisResult{
+			EventType:  "NormalBusinessActivity",
+			Category:   "Operational",
+			Severity:   "Low",
+			Confidence: 0.95,
+			AISummary:  "System operating normally under baseline parameters.",
 		}
 	}
 
-	severity := "Low"
-	eventType := "NormalBusinessActivity"
-	category := "Operational"
-	summary := "System operating normally under baseline parameters."
+	hasRain := false
+	hasHighTraffic := false
+	hasAdActivity := false
+	hasScheduledEvent := false
 
-	if guardrails.IsLowVolume {
-		summary = "Low user traffic volume detected. System operating under normal off-peak baseline parameters."
-	} else if hasRain && (hasHighGA || hasHoliday) {
+	for _, m := range drivingMetrics {
+		metricType := m
+		if idx := strings.LastIndex(m, ":"); idx != -1 {
+			metricType = m[idx+1:]
+		}
+		switch metricType {
+		case "rain_mm":
+			hasRain = true
+		case "active_users":
+			hasHighTraffic = true
+		case "ad_spend_usd", "ad_ctr_pct", "page_post_engagements", "page_engaged_users":
+			hasAdActivity = true
+		}
+	}
+	for _, r := range rulesTriggered {
+		if strings.HasPrefix(r, "scheduled_event:") {
+			hasScheduledEvent = true
+		}
+	}
+
+	eventType := "SignificantDeviationDetected"
+	category := "Operational"
+	severity := "Medium"
+	summary := fmt.Sprintf("Statistically significant deviation from seasonal baseline detected (%s); classified deterministically, Gemini AI unavailable.", strings.Join(rulesTriggered, ", "))
+
+	switch {
+	case hasScheduledEvent:
+		eventType = "ScheduledBusinessEvent"
+		category = "Business Calendar"
+		severity = "High"
+		summary = "A known scheduled business event (public holiday, campaign window, or product launch) is active or imminent."
+	case hasRain && hasHighTraffic:
 		eventType = "WeatherDemandShift"
 		category = "Environmental"
 		severity = "High"
 		summary = "Heavy rainfall combined with high user activity predicts increased demand for ride/delivery operations."
-	} else if hasHighMeta || hasHighGA {
+	case hasAdActivity || hasHighTraffic:
 		eventType = "MarketingMomentumSurge"
 		category = "Marketing"
 		severity = "Medium"
-		summary = "Active marketing campaign and web traffic surge indicating elevated application load."
+		summary = "Active marketing/engagement activity coincides with a statistically significant deviation from baseline."
+	}
+
+	if guardrails.IsLowVolume {
+		// Low volume no longer overrides significance outright (the gate
+		// already accounted for it when deciding to invoke this function at
+		// all) — it only tempers confidence, since a ratio-based signal is
+		// less trustworthy on a small sample even when a count-based one
+		// (like active_users itself) is what actually triggered the rule.
+		severity = "Medium"
 	}
 
 	res := &AIAnalysisResult{
 		EventType:  eventType,
 		Category:   category,
 		Severity:   severity,
-		Confidence: 0.95,
+		Confidence: 0.85,
 		AISummary:  summary,
 	}
 

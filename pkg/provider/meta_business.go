@@ -18,6 +18,7 @@ import (
 type MetaBusinessProvider struct {
 	cfg        *config.Config
 	httpClient *http.Client
+	BaseURL    string
 }
 
 type metaInsightsResponse struct {
@@ -38,11 +39,16 @@ type metaInsightsResponse struct {
 }
 
 func NewMetaBusinessProvider(cfg *config.Config) *MetaBusinessProvider {
+	baseURL := cfg.MetaGraphBaseURL
+	if baseURL == "" {
+		baseURL = "https://graph.facebook.com/v19.0"
+	}
 	return &MetaBusinessProvider{
 		cfg: cfg,
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
+		BaseURL: baseURL,
 	}
 }
 
@@ -51,7 +57,7 @@ func (p *MetaBusinessProvider) Name() string {
 }
 
 func (p *MetaBusinessProvider) PollFrequency() time.Duration {
-	return 1 * time.Minute
+	return pollFrequencyOr(p.cfg.MetaPollInterval, 1*time.Minute)
 }
 
 func (p *MetaBusinessProvider) Fetch(ctx context.Context) ([]model.Signal, error) {
@@ -68,7 +74,8 @@ func (p *MetaBusinessProvider) Fetch(ctx context.Context) ([]model.Signal, error
 	log.Printf("[INFO] [MetaBusiness] Querying Meta Graph API for Ad Account ID: %s", adAccountID)
 
 	url := fmt.Sprintf(
-		"https://graph.facebook.com/v19.0/%s/insights?fields=spend,impressions,clicks,ctr,cpc&date_preset=today&access_token=%s",
+		"%s/%s/insights?fields=spend,impressions,clicks,ctr,cpc&date_preset=today&access_token=%s",
+		p.BaseURL,
 		adAccountID,
 		p.cfg.MetaAccessToken,
 	)

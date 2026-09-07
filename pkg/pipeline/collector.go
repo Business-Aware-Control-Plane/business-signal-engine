@@ -16,12 +16,26 @@ import (
 )
 
 type Collector struct {
-	providers   []provider.SignalProvider
-	repo        storage.SignalRepository
-	validator   *processor.SignalValidator
-	aligner     *processor.SlidingWindowAligner
-	corrEngine  *correlation.CorrelationEngine
-	publisher   publisher.EventPublisher
+	providers  []provider.SignalProvider
+	repo       storage.SignalRepository
+	validator  *processor.SignalValidator
+	aligner    *processor.SlidingWindowAligner
+	lkv        *processor.LastKnownValueStore
+	corrEngine *correlation.CorrelationEngine
+	publisher  publisher.EventPublisher
+
+	// ingest is the persistent fan-in used by RunDaemon: both the per-provider
+	// poll producers and any external push source (the webhook ingestor,
+	// BSAL-HB-01 §05) write into the same channel, so a webhook delivery is
+	// batched and correlated exactly like a polled signal, not a parallel path.
+	//
+	// ingestMu guards ingestClosed so a concurrent Ingest() and shutdown close
+	// can never race — checking "is it closed" and closing it both happen
+	// under the same lock, which a bare atomic-bool guard cannot guarantee
+	// (a send could still land after the check but during the close).
+	ingest       chan model.Signal
+	ingestMu     sync.Mutex
+	ingestClosed bool
 }
 
 func NewCollector(
@@ -35,9 +49,54 @@ func NewCollector(
 		repo:       repo,
 		validator:  processor.NewSignalValidator(),
 		aligner:    processor.NewSlidingWindowAligner(5 * time.Minute),
+		lkv:        processor.NewLastKnownValueStore(),
 		corrEngine: corrEngine,
 		publisher:  pub,
+		ingest:     make(chan model.Signal, 500),
 	}
+}
+
+// Ingest accepts a single push-delivered signal (currently: the webhook
+// ingestor) into the same fan-in RunDaemon's poll producers write to. Safe
+// to call concurrently, including racing against shutdown: the check and the
+// send happen under the same lock a shutdown close also takes, so a signal
+// is either delivered or cleanly dropped-and-logged, never sent to a closed
+// channel.
+func (c *Collector) Ingest(s model.Signal) {
+	c.ingestMu.Lock()
+	defer c.ingestMu.Unlock()
+	if c.ingestClosed {
+		log.Printf("[WARN] [Collector] Dropping ingested signal after shutdown: %s:%s", s.Source, s.Type)
+		return
+	}
+	c.ingest <- s
+}
+
+// closeIngest is the single place c.ingest is ever closed, guarded so it is
+// safe to call even if shutdown logic changes later to call it from more
+// than one place.
+func (c *Collector) closeIngest() {
+	c.ingestMu.Lock()
+	defer c.ingestMu.Unlock()
+	if !c.ingestClosed {
+		c.ingestClosed = true
+		close(c.ingest)
+	}
+}
+
+// fetchAndObserve wraps a single provider's Fetch call, recording the result
+// in the last-known-value cache with that provider's own poll frequency
+// before the signals ever reach the shared fan-in channel. This is what lets
+// a slow-cadence source (weather, calendar) still be carried into a later,
+// faster correlation window instead of requiring it to have polled inside
+// that exact window (BSAL-HB-01 §03).
+func (c *Collector) fetchAndObserve(ctx context.Context, prov provider.SignalProvider) ([]model.Signal, error) {
+	signals, err := prov.Fetch(ctx)
+	if err != nil {
+		return nil, err
+	}
+	c.lkv.Observe(signals, prov.PollFrequency())
+	return signals, nil
 }
 
 // RunOneShot executes signal collection, validation, correlation, timeline storage, and RabbitMQ publishing once.
@@ -52,7 +111,7 @@ func (c *Collector) RunOneShot(ctx context.Context) error {
 		go func(prov provider.SignalProvider) {
 			defer wg.Done()
 			log.Printf("[INFO] Executing provider '%s' goroutine...", prov.Name())
-			signals, err := prov.Fetch(ctx)
+			signals, err := c.fetchAndObserve(ctx, prov)
 			if err != nil {
 				log.Printf("[ERROR] Provider '%s' failed: %v", prov.Name(), err)
 				return
@@ -83,11 +142,12 @@ func (c *Collector) RunOneShot(ctx context.Context) error {
 		}
 	}
 
-	// 3. Sliding Window Alignment & Correlation Analysis
+	// 3. Sliding Window Alignment, carried-forward context, and Correlation Analysis
 	now := time.Now()
 	window, aligned := c.aligner.AlignToWindow(validSignals, now)
+	windowCtx := processor.BuildContext(aligned, c.lkv, now)
 
-	event, err := c.corrEngine.Evaluate(ctx, window, aligned)
+	event, err := c.corrEngine.Evaluate(ctx, window, windowCtx)
 	if err != nil {
 		log.Printf("[WARN] Correlation analysis error: %v", err)
 	}
@@ -112,11 +172,11 @@ func (c *Collector) RunOneShot(ctx context.Context) error {
 	return nil
 }
 
-// RunDaemon starts continuous polling goroutines per provider and streams events to RabbitMQ.
+// RunDaemon starts continuous polling goroutines per provider, accepts any
+// pushed webhook deliveries via Ingest, and streams events to RabbitMQ.
 func (c *Collector) RunDaemon(ctx context.Context) error {
 	log.Printf("[INFO] Starting Daemon pipeline collector with %d registered providers", len(c.providers))
 
-	signalChan := make(chan model.Signal, 500)
 	var wg sync.WaitGroup
 
 	// Consumer & Correlation Pipeline Goroutine
@@ -136,7 +196,8 @@ func (c *Collector) RunDaemon(ctx context.Context) error {
 				_ = c.repo.SaveSignals(ctx, valid)
 				now := time.Now()
 				window, aligned := c.aligner.AlignToWindow(valid, now)
-				evt, err := c.corrEngine.Evaluate(ctx, window, aligned)
+				windowCtx := processor.BuildContext(aligned, c.lkv, now)
+				evt, err := c.corrEngine.Evaluate(ctx, window, windowCtx)
 				if err == nil && evt != nil {
 					if evt.EventID == "" {
 						evt.EventID = uuid.New().String()
@@ -150,7 +211,7 @@ func (c *Collector) RunDaemon(ctx context.Context) error {
 
 		for {
 			select {
-			case sig, ok := <-signalChan:
+			case sig, ok := <-c.ingest:
 				if !ok {
 					processBatch()
 					return
@@ -174,10 +235,10 @@ func (c *Collector) RunDaemon(ctx context.Context) error {
 		go func(prov provider.SignalProvider) {
 			defer wg.Done()
 
-			signals, err := prov.Fetch(ctx)
+			signals, err := c.fetchAndObserve(ctx, prov)
 			if err == nil {
 				for _, s := range signals {
-					signalChan <- s
+					c.Ingest(s)
 				}
 			}
 
@@ -187,12 +248,12 @@ func (c *Collector) RunDaemon(ctx context.Context) error {
 			for {
 				select {
 				case <-ticker.C:
-					sigs, err := prov.Fetch(ctx)
+					sigs, err := c.fetchAndObserve(ctx, prov)
 					if err != nil {
 						continue
 					}
 					for _, s := range sigs {
-						signalChan <- s
+						c.Ingest(s)
 					}
 				case <-ctx.Done():
 					return
@@ -203,7 +264,7 @@ func (c *Collector) RunDaemon(ctx context.Context) error {
 
 	<-ctx.Done()
 	log.Printf("[INFO] Shutdown signal received. Flushing pipeline buffers...")
-	close(signalChan)
+	c.closeIngest()
 	wg.Wait()
 	log.Printf("[INFO] Daemon collector pipeline shutdown complete.")
 	return nil

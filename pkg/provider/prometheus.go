@@ -44,7 +44,7 @@ func (p *PrometheusProvider) Name() string {
 }
 
 func (p *PrometheusProvider) PollFrequency() time.Duration {
-	return 1 * time.Minute
+	return pollFrequencyOr(p.cfg.PrometheusPollInterval, 1*time.Minute)
 }
 
 func (p *PrometheusProvider) Fetch(ctx context.Context) ([]model.Signal, error) {
@@ -54,7 +54,7 @@ func (p *PrometheusProvider) Fetch(ctx context.Context) ([]model.Signal, error) 
 	}
 
 	queries := map[string]string{
-		"system_cpu_utilization_pct":  `100 - (avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)`,
+		"system_cpu_utilization_pct":    `100 - (avg(rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)`,
 		"system_memory_utilization_pct": `((node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / node_memory_MemTotal_bytes) * 100`,
 		"http_requests_per_sec":         `sum(rate(http_requests_total[5m]))`,
 		"http_5xx_error_rate_pct":       `(sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total[5m]))) * 100`,
@@ -76,9 +76,9 @@ func (p *PrometheusProvider) Fetch(ctx context.Context) ([]model.Signal, error) 
 		}
 
 		signals = append(signals, model.Signal{
-			Source:          "prometheus",
-			Type:            metricType,
-			Value:           val,
+			Source:     "prometheus",
+			Type:       metricType,
+			Value:      val,
 			Unit:       unit,
 			Confidence: 0.95,
 			Timestamp:  now,

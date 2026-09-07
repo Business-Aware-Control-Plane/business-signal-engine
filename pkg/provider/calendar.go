@@ -16,6 +16,7 @@ import (
 type CalendarProvider struct {
 	cfg        *config.Config
 	httpClient *http.Client
+	BaseURL    string
 }
 
 type nagerHoliday struct {
@@ -27,11 +28,16 @@ type nagerHoliday struct {
 }
 
 func NewCalendarProvider(cfg *config.Config) *CalendarProvider {
+	baseURL := cfg.CalendarBaseURL
+	if baseURL == "" {
+		baseURL = "https://date.nager.at"
+	}
 	return &CalendarProvider{
 		cfg: cfg,
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
+		BaseURL: baseURL,
 	}
 }
 
@@ -40,13 +46,13 @@ func (p *CalendarProvider) Name() string {
 }
 
 func (p *CalendarProvider) PollFrequency() time.Duration {
-	return 30 * time.Minute
+	return pollFrequencyOr(p.cfg.CalendarPollInterval, 30*time.Minute)
 }
 
 func (p *CalendarProvider) Fetch(ctx context.Context) ([]model.Signal, error) {
 	now := time.Now()
 	year := now.Year()
-	url := fmt.Sprintf("https://date.nager.at/api/v3/PublicHolidays/%d/%s", year, p.cfg.CountryCode)
+	url := fmt.Sprintf("%s/api/v3/PublicHolidays/%d/%s", p.BaseURL, year, p.cfg.CountryCode)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
