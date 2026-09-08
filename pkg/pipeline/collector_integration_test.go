@@ -76,6 +76,18 @@ func (r *fakeRepo) GetBusinessTimeline(ctx context.Context, limit int) ([]model.
 	return append([]model.BusinessEvent{}, r.events...), nil
 }
 
+func (r *fakeRepo) GetBusinessTimelineInWindow(ctx context.Context, start, end time.Time) ([]model.BusinessEvent, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []model.BusinessEvent
+	for _, e := range r.events {
+		if !e.Timestamp.Before(start) && !e.Timestamp.After(end) {
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
 func baselineKey(metricKey string, dayOfWeek, hourOfDay int) string {
 	return fmt.Sprintf("%s|%d|%d", metricKey, dayOfWeek, hourOfDay)
 }
@@ -270,5 +282,46 @@ func TestRunDaemon_ConcurrentIngestDuringShutdown(t *testing.T) {
 	repo.mu.Unlock()
 	if signalCount == 0 {
 		t.Fatalf("expected at least some ingested signals to have been persisted before shutdown")
+	}
+}
+
+// TestGetBusinessTimelineInWindow_FiltersAndIncludesBoundaries locks in the
+// behaviour scenario-conductor's report step depends on: inclusive
+// boundaries (a run's start/end timestamps should count), and events
+// outside the window excluded.
+func TestGetBusinessTimelineInWindow_FiltersAndIncludesBoundaries(t *testing.T) {
+	repo := newFakeRepo()
+	now := time.Now()
+	ctx := context.Background()
+
+	events := []model.BusinessEvent{
+		{EventID: "before", Timestamp: now.Add(-10 * time.Minute)},
+		{EventID: "at-start", Timestamp: now.Add(-5 * time.Minute)},
+		{EventID: "inside", Timestamp: now},
+		{EventID: "at-end", Timestamp: now.Add(5 * time.Minute)},
+		{EventID: "after", Timestamp: now.Add(10 * time.Minute)},
+	}
+	for i := range events {
+		_ = repo.SaveBusinessEvent(ctx, &events[i])
+	}
+
+	got, err := repo.GetBusinessTimelineInWindow(ctx, now.Add(-5*time.Minute), now.Add(5*time.Minute))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("expected 3 events within [start, end] inclusive, got %d: %+v", len(got), got)
+	}
+	ids := map[string]bool{}
+	for _, e := range got {
+		ids[e.EventID] = true
+	}
+	for _, want := range []string{"at-start", "inside", "at-end"} {
+		if !ids[want] {
+			t.Errorf("expected %q to be included in the window, got %+v", want, got)
+		}
+	}
+	if ids["before"] || ids["after"] {
+		t.Errorf("expected events outside the window to be excluded, got %+v", got)
 	}
 }

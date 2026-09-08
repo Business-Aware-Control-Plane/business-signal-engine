@@ -213,6 +213,29 @@ func (r *mongoRepository) GetBusinessTimeline(ctx context.Context, limit int) ([
 	return events, nil
 }
 
+func (r *mongoRepository) GetBusinessTimelineInWindow(ctx context.Context, start, end time.Time) ([]model.BusinessEvent, error) {
+	filter := bson.D{
+		{Key: "timestamp", Value: bson.D{
+			{Key: "$gte", Value: start},
+			{Key: "$lte", Value: end},
+		}},
+	}
+	opts := options.Find().SetSort(bson.D{{Key: "timestamp", Value: 1}})
+
+	cursor, err := r.timelineCollection.Find(ctx, filter, opts)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query business timeline window: %w", err)
+	}
+	defer cursor.Close(ctx)
+
+	var events []model.BusinessEvent
+	if err := cursor.All(ctx, &events); err != nil {
+		return nil, fmt.Errorf("failed to decode business timeline window events: %w", err)
+	}
+
+	return events, nil
+}
+
 func (r *mongoRepository) GetBaselineProfile(ctx context.Context, metricKey string, dayOfWeek, hourOfDay int) (*model.BaselineProfile, error) {
 	filter := bson.D{
 		{Key: "metricKey", Value: metricKey},
