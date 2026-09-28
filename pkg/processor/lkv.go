@@ -1,6 +1,7 @@
 package processor
 
 import (
+	"strings"
 	"sync"
 	"time"
 
@@ -45,19 +46,43 @@ func NewLastKnownValueStore() *LastKnownValueStore {
 
 // Observe records a freshly fetched batch as the new last-known-value for
 // each of its source:type keys, and registers that source's carry-forward
-// ceiling from its own poll frequency. Call this once per provider fetch,
-// with that provider's own PollFrequency() — not once per merged batch —
-// so each source's ceiling reflects its own cadence, not a shared default.
-func (l *LastKnownValueStore) Observe(signals []model.Signal, pollFrequency time.Duration) {
-	if len(signals) == 0 {
-		return
-	}
+// ceiling from its own poll frequency. Call this once per provider fetch —
+// including a successful fetch that returned zero signals — with that
+// provider's own source identity and PollFrequency(), not once per merged
+// batch, so each source's ceiling reflects its own cadence, not a shared
+// default.
+//
+// A successful poll, even an empty one, is authoritative about that
+// source's current state: any previously-cached key under the same source
+// that this fetch didn't reconfirm is dropped immediately, rather than
+// left to linger until its own age ceiling expires. Without this, a
+// scheduled-event flag that genuinely ended (e.g. a campaign withdrawn, or
+// simply a different scenario's fresh, campaign-free bizsim instance) could
+// keep re-triggering significance for up to pollFrequency*carryDecayFactor
+// after the source itself has already reported it's gone — the exact
+// mechanism behind SIM-HB-01 §08's cross-scenario contamination finding
+// (2026-09-28): `Observe` was silently no-op'ing on empty fetches, so an
+// old campaign_window=1 reading from a prior scenario's run was never
+// cleared by the next scenario's own correctly-empty polls, only by time
+// alone.
+func (l *LastKnownValueStore) Observe(source string, signals []model.Signal, pollFrequency time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
+	seenThisFetch := make(map[string]bool, len(signals))
 	for _, s := range signals {
-		l.latest[s.Source+":"+s.Type] = s
-		if pollFrequency > 0 {
-			l.maxAge[s.Source] = time.Duration(float64(pollFrequency) * carryDecayFactor)
+		key := s.Source + ":" + s.Type
+		seenThisFetch[key] = true
+		l.latest[key] = s
+	}
+	if pollFrequency > 0 {
+		l.maxAge[source] = time.Duration(float64(pollFrequency) * carryDecayFactor)
+	}
+
+	prefix := source + ":"
+	for key := range l.latest {
+		if strings.HasPrefix(key, prefix) && !seenThisFetch[key] {
+			delete(l.latest, key)
 		}
 	}
 }

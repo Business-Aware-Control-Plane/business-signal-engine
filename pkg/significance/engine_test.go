@@ -54,6 +54,79 @@ func TestEvaluate_ScheduledEventFlagZero_NotSignificantOnItsOwn(t *testing.T) {
 	}
 }
 
+// ---- Corroboration: a reach-style social spike needs engaged_users to
+// move too, otherwise it's exactly the bot/inorganic-amplification pattern
+// Scenario 6 (false-positive-social-spike) is meant to test. See SIM-HB-01
+// §08 for why "did real traffic eventually follow" can never be the basis
+// for this rule — only what's observable in the current window can be.
+
+func TestEvaluate_ReachSpikeWithoutEngagedUsersCorroboration_NotSignificant(t *testing.T) {
+	signals := []model.Signal{{Source: "social_media", Type: "page_impressions", Value: 9600}}
+	baselines := map[string]memory.BaselineComparison{
+		"social_media:page_impressions":   {SeasonalZScore: 6.0}, // reach spikes hard
+		"social_media:page_engaged_users": {SeasonalZScore: 0.2}, // but almost nobody real engaged
+	}
+	res := significance.Evaluate(signals, baselines, processor.GuardrailResult{})
+
+	if res.IsSignificant {
+		t.Fatalf("expected an uncorroborated reach spike (impressions moved, engaged_users didn't) to stay insignificant, got true (score=%.2f, rules=%v)", res.Score, res.TriggeredRules)
+	}
+}
+
+func TestEvaluate_ReachSpikeWithEngagedUsersCorroboration_IsSignificant(t *testing.T) {
+	signals := []model.Signal{{Source: "social_media", Type: "page_impressions", Value: 9600}}
+	baselines := map[string]memory.BaselineComparison{
+		"social_media:page_impressions":   {SeasonalZScore: 6.0}, // reach spikes
+		"social_media:page_engaged_users": {SeasonalZScore: 5.5}, // and real people actually engaged too
+	}
+	res := significance.Evaluate(signals, baselines, processor.GuardrailResult{})
+
+	if !res.IsSignificant {
+		t.Fatalf("expected a corroborated reach spike (both impressions and engaged_users moved) to be significant")
+	}
+	if len(res.TriggeredRules) != 2 {
+		t.Fatalf("expected both corroborating metrics to be recorded as triggered rules, got %v", res.TriggeredRules)
+	}
+}
+
+func TestEvaluate_PostEngagementsSpikeWithoutCorroboration_NotSignificant(t *testing.T) {
+	signals := []model.Signal{{Source: "social_media", Type: "page_post_engagements", Value: 480}}
+	baselines := map[string]memory.BaselineComparison{
+		"social_media:page_post_engagements": {SeasonalZScore: 5.0},
+		"social_media:page_engaged_users":    {SeasonalZScore: -0.1},
+	}
+	res := significance.Evaluate(signals, baselines, processor.GuardrailResult{})
+
+	if res.IsSignificant {
+		t.Fatalf("expected an uncorroborated post-engagements spike to stay insignificant, got true")
+	}
+}
+
+func TestEvaluate_ReachSpikeWithMissingCompanionBaseline_FailsSafeToNotSignificant(t *testing.T) {
+	signals := []model.Signal{{Source: "social_media", Type: "page_impressions", Value: 9600}}
+	baselines := map[string]memory.BaselineComparison{
+		"social_media:page_impressions": {SeasonalZScore: 6.0},
+		// no page_engaged_users entry at all this window
+	}
+	res := significance.Evaluate(signals, baselines, processor.GuardrailResult{})
+
+	if res.IsSignificant {
+		t.Fatalf("expected a missing companion baseline to fail safe (not significant), got true")
+	}
+}
+
+func TestEvaluate_UnrelatedMetricNeedsNoCorroboration(t *testing.T) {
+	signals := []model.Signal{{Source: "weather", Type: "rain_mm", Value: 18}}
+	baselines := map[string]memory.BaselineComparison{
+		"weather:rain_mm": {SeasonalZScore: 3.1}, // not in corroborationPairs — should behave exactly as before
+	}
+	res := significance.Evaluate(signals, baselines, processor.GuardrailResult{})
+
+	if !res.IsSignificant {
+		t.Fatalf("expected an unrelated (non-social) metric to remain significant on its own, unaffected by the corroboration rule")
+	}
+}
+
 func TestEvaluate_LowVolumeGuardrail_SuppressesFlaggedRatioMetric(t *testing.T) {
 	signals := []model.Signal{{Source: "google_analytics", Type: "engagement_rate", Value: 100}}
 	baselines := map[string]memory.BaselineComparison{

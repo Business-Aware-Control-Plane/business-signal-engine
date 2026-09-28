@@ -84,6 +84,24 @@ func (c *Collector) closeIngest() {
 	}
 }
 
+// providerSourceNames maps each provider's Name() (a display-oriented
+// string, not necessarily matching what it puts in model.Signal.Source) to
+// the exact Source string its signals actually carry. LastKnownValueStore
+// needs this specifically for the empty-fetch case — when a provider polls
+// successfully and returns nothing, there is no model.Signal on hand to
+// read .Source from, so its identity has to come from somewhere else.
+var providerSourceNames = map[string]string{
+	"BusinessCalendar":     "business_calendar",
+	"Calendar":             "calendar",
+	"GoogleAnalytics":      "google_analytics",
+	"MetaBusiness":         "meta_business",
+	"Prometheus":           "prometheus",
+	"SocialMedia":          "social_media",
+	"SimulatorStream":      "simulated_google_analytics",
+	"Weather":              "weather",
+	"StripeReconciliation": "stripe",
+}
+
 // fetchAndObserve wraps a single provider's Fetch call, recording the result
 // in the last-known-value cache with that provider's own poll frequency
 // before the signals ever reach the shared fan-in channel. This is what lets
@@ -95,7 +113,11 @@ func (c *Collector) fetchAndObserve(ctx context.Context, prov provider.SignalPro
 	if err != nil {
 		return nil, err
 	}
-	c.lkv.Observe(signals, prov.PollFrequency())
+	source := providerSourceNames[prov.Name()]
+	if source == "" && len(signals) > 0 {
+		source = signals[0].Source
+	}
+	c.lkv.Observe(source, signals, prov.PollFrequency())
 	return signals, nil
 }
 

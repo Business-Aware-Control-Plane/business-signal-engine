@@ -34,6 +34,32 @@ var scheduledEventTypes = map[string]bool{
 	"product_launch":  true,
 }
 
+// corroborationPairs names metrics whose own significance is not trusted in
+// isolation — each requires its paired "companion" metric to also show at
+// least CorroborationZThreshold of deviation in the same window before the
+// first metric counts toward IsSignificant.
+//
+// This exists specifically for reach-style social metrics (impressions,
+// post engagements): a real viral moment lifts unique engaged users right
+// alongside reach, but bot/inorganic amplification inflates reach without a
+// proportional lift in unique engagement — the one distinguishing signal
+// available *at detection time*, unlike "did real traffic eventually
+// follow," which isn't knowable yet and so can never be a legitimate basis
+// for a significance rule (see SIM-HB-01 §08's Scenario 3 vs. 6 finding:
+// both scenarios have an identical business-track input, differing only in
+// what happens afterward — no rule keyed on future traffic could ever
+// distinguish them without breaking Scenario 3's whole reason to exist,
+// early detection ahead of real demand).
+var corroborationPairs = map[string]string{
+	"social_media:page_impressions":      "social_media:page_engaged_users",
+	"social_media:page_post_engagements": "social_media:page_engaged_users",
+}
+
+// CorroborationZThreshold is deliberately lower than SeasonalZThreshold — the
+// companion metric only needs to show it moved too, not independently clear
+// the full significance bar on its own.
+var CorroborationZThreshold = 1.0
+
 // Result is the deterministic verdict handed to CorrelationEngine. Score is
 // the largest |seasonal z-score| observed across metrics in the window, kept
 // signed (not absolute) so downstream logging/debugging can tell an increase
@@ -61,6 +87,7 @@ func Evaluate(signals []model.Signal, baselines map[string]memory.BaselineCompar
 		res.DrivingMetrics = append(res.DrivingMetrics, fmt.Sprintf("%s:%s", s.Source, s.Type))
 	}
 
+	var uncorroborated []string
 	for key, b := range baselines {
 		if guardrails.IsLowVolume && isSuppressed(key, guardrails) {
 			continue
@@ -69,10 +96,18 @@ func Evaluate(signals []model.Signal, baselines map[string]memory.BaselineCompar
 			res.Score = b.SeasonalZScore
 		}
 		if math.Abs(b.SeasonalZScore) > SeasonalZThreshold {
+			if companion, needsCorroboration := corroborationPairs[key]; needsCorroboration && !corroborates(companion, baselines) {
+				uncorroborated = append(uncorroborated, fmt.Sprintf("%s=%.2f (needs %s)", key, b.SeasonalZScore, companion))
+				continue
+			}
 			res.IsSignificant = true
 			res.TriggeredRules = append(res.TriggeredRules, fmt.Sprintf("seasonal_z:%s=%.2f", key, b.SeasonalZScore))
 			res.DrivingMetrics = append(res.DrivingMetrics, key)
 		}
+	}
+
+	if len(uncorroborated) > 0 && !res.IsSignificant {
+		log.Printf("[DEBUG] [SignificanceEngine] Suppressed uncorroborated reach spike(s): %v", uncorroborated)
 	}
 
 	if res.IsSignificant {
@@ -82,6 +117,18 @@ func Evaluate(signals []model.Signal, baselines map[string]memory.BaselineCompar
 	}
 
 	return res
+}
+
+// corroborates reports whether companionKey's own baseline shows at least
+// CorroborationZThreshold of deviation — absent entirely (e.g. suppressed by
+// a low-volume guardrail, or genuinely never observed this window) counts as
+// "does not corroborate," a fail-safe default rather than assuming the best.
+func corroborates(companionKey string, baselines map[string]memory.BaselineComparison) bool {
+	companion, ok := baselines[companionKey]
+	if !ok {
+		return false
+	}
+	return math.Abs(companion.SeasonalZScore) >= CorroborationZThreshold
 }
 
 func isSuppressed(key string, g processor.GuardrailResult) bool {
